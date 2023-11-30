@@ -9,6 +9,11 @@ from datetime import datetime, timedelta
 from dateparser import parse
 from database.database import add_car_ad, init_db, CarAd, Session
 
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+
 # Конфигурация логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -72,13 +77,16 @@ class AsyncCarAdParser:
         'Connection': 'keep-alive',
     }
 
+
     async def init_session(self):
         self.session = aiohttp.ClientSession()
+
 
     async def close_session(self):
         if self.session:
             await self.session.close()
             self.session = None
+
 
     async def fetch_links(self):
         logger.info("Fetching links...")
@@ -87,103 +95,148 @@ class AsyncCarAdParser:
             soup = BeautifulSoup(html, "html.parser")
             return [a['href'] for a in soup.find_all('a', href=True) if self.COMPARE_URL in a['href']]
 
+
     async def get(self, url):
-        async with self.session.get(url) as response:
-            return await response.text()
+        try:
+            async with self.session.get(url) as response:
+                return await response.text()
+        except Exception as e:
+            logger.error(f"Error fetching URL {url}: {e}")
+            return None
+
 
     async def fetch_ad_details(self, url):
-        logger.info(f"Fetching ad details from {url}")
-        async with self.session.get(url, headers=self.HEADERS) as response:
-            html = await response.text()
-            soup = BeautifulSoup(html, "html.parser")
+        try:
+            logger.info(f"Fetching ad details from {url}")
+            async with self.session.get(url, headers=self.HEADERS) as response:
+                html = await response.text()
+                if html:
+                    soup = BeautifulSoup(html, "html.parser")
+                    # Извлечение всех данных, включая дату, с помощью BeautifulSoup
+                    attributes = self.extract_all_data(soup)
+                    if not attributes['ad_date']:
+                        # Если дата не найдена, используйте Selenium
+                        ad_date = await self.fetch_ad_date_with_selenium(url)
+                        attributes['ad_date'] = ad_date
+                    logger.info("Ad details extracted successfully")
+                    return attributes
+                else:
+                    logger.error(f"No HTML content retrieved for URL: {url}")
+                    return None
+        except Exception as e:
+            logger.error(f"Error fetching ad details from {url}: {e}")
+            return None
+        
 
-            attributes = {}
-            car_info = soup.find('span', {'class': 'argument d-link__name'})
-            if car_info:
-                brand, model, year = self.extract_brand_model_year(car_info.text)
-                attributes['brand'] = brand
-                attributes['model'] = model
-                attributes['year'] = year
+    async def fetch_ad_date_with_selenium(self, url):
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
 
-            # Извлечение дополнительных данных
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+
+        try:
+            driver.get(url)
+            await asyncio.sleep(3)  # Дайте странице время для загрузки
+
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            ad_date_info = soup.find("li", {"id": "addDate"})
+            if ad_date_info and ad_date_info.find("span"):
+                ad_date = ad_date_info.find("span").text.strip()
+                return ad_date
+            else:
+                logger.error(f"Ad date info not found in URL: {url}")
+                ad_date = "Не указано"
+                return None
+
+        except Exception as e:
+            logger.error(f"Error fetching ad date from {url} using Selenium: {e}")
+            return None
+        finally:
+            driver.quit()
+
+
+    def extract_all_data(self, soup):
+        data = {}
+
+        # Марка, модель, и год автомобиля
+        car_info = soup.find('span', {'class': 'argument d-link__name'})
+        if car_info and car_info.text:
+            brand, model, year = self.extract_brand_model_year(car_info.text)
+            data['brand'] = brand
+            data['model'] = model
+            data['year'] = year
+
+        try:
             auto_wrap = soup.find('div', {'class': 'auto-wrap'})
             if auto_wrap:
-                body_data = auto_wrap.text.split('\n')
-                for block in body_data:
+                text_blocks = auto_wrap.text.split('\n')
+                for block in text_blocks:
                     block = block.strip()
                     if block.startswith("Ціна:"):
-                        attributes['price'] = block.split("•")[0].replace("Ціна:", "").strip()
+                        data['price'] = block.split("•")[0].replace("Ціна:", "").strip()
                     elif block.startswith("Пробіг"):
-                        attributes['mileage'] = block.split("•")[0].replace("Пробіг", "").strip()
+                        data['mileage'] = block.split("•")[0].replace("Пробіг", "").strip()
                     elif block.startswith("Двигун"):
-                        attributes['engine'] = block.replace("Двигун", "").strip()
-                    # Добавление других атрибутов по необходимости
+                        data['engine'] = block.replace("Двигун", "").strip()
+        except Exception as e:
+            logger.error(f"Error processing auto_wrap for, error: {e}")
 
-            seller_info, ad_date = await self.extract_seller_info(url, soup)
-            attributes['seller_name'] = seller_info
-            attributes['ad_date'] = ad_date
 
-            # Извлечение данных для номеров телефонов
-            script_tag = soup.find("script", attrs={'src': False, 'data-user-secure-hash': True})
-            if script_tag:
-                attributes['hash_data'] = {
-                    'hash': script_tag.get('data-user-secure-hash', None),
-                    'expires': script_tag.get('data-user-secure-expires', None)
-                }
-                attributes['ad_id'] = script_tag.get('data-advertisement-id', None)
+        # Информация о продавце и дате объявления
+        seller_info = soup.find("div", class_="seller_info_name")
+        data['seller_name'] = seller_info.text.strip() if seller_info else "Не указано"
 
-            attributes['phone_numbers'] = await self.fetch_phone_numbers(attributes['ad_id'], attributes['hash_data']) if 'ad_id' in attributes and 'hash_data' in attributes else []
+        ad_date_info = soup.find("li", {"id": "addDate"})
+        ad_date = ad_date_info.find("span").text.strip() if ad_date_info and ad_date_info.find("span") else "Не указано"
+        data['ad_date'] = self.convert_relative_date_ukrainian(ad_date)
 
-            logger.info("Ad details extracted successfully")
-            return attributes
+        return data
     
-    def get_additional_attributes(self, soup):
-        additional_attrs = {}
-        auto_wrap = soup.find('div', class_='auto-wrap')
-        if auto_wrap:
-            text_blocks = auto_wrap.text.split('\n')
-            for block in text_blocks:
-                block = block.strip()
-                if block.startswith("Ціна:"):
-                    additional_attrs['price'] = block.split("•")[0].replace("Ціна:", "").strip()
-                elif block.startswith("Пробіг"):
-                    additional_attrs['mileage'] = block.split("•")[0].replace("Пробіг", "").strip()
-                elif block.startswith("Двигун"):
-                    additional_attrs['engine'] = block.replace("Двигун", "").strip()
-                # Добавьте логику для остальных атрибутов
 
-        return additional_attrs
-    
     def extract_brand_model_year(self, full_string):
         # Логика извлечения марки, модели и года
         parts = full_string.split()
-        year = parts[-1] if parts[-1].isdigit() else None
-        brand_model = ' '.join(parts[:-1]) if year else full_string
-        for brand in self.KNOWN_BRANDS:
-            if brand in brand_model:
-                start = brand_model.find(brand)
-                end = start + len(brand)
-                model = brand_model[end:].strip()
-                return brand, model, year
-        return None, None, year
+        if parts:
+            year = parts[-1] if parts[-1].isdigit() else None
+            brand_model = ' '.join(parts[:-1]) if year else full_string
+            for brand in self.KNOWN_BRANDS:
+                if brand in brand_model:
+                    start = brand_model.find(brand)
+                    end = start + len(brand)
+                    model = brand_model[end:].strip()
+                    return brand, model, year
+            return None, None, year
+        else:
+            return None, None, None
+ 
 
+    # async def extract_seller_info(self, url, soup):
+    #     seller_info = soup.find("div", class_="seller_info_name")
+    #     seller_name = seller_info.text.strip() if seller_info else "Не указано"
 
-    async def extract_seller_info(self, url, soup):
-        seller_info = soup.find("div", class_="seller_info_name")
-        seller_name = seller_info.text.strip() if seller_info else "Не указано"
-        ad_date_info = soup.find("span", {"id": "addDate"})
-        ad_date = ad_date_info.text.strip() if ad_date_info else "Не указано"
-        ad_date_converted = self.convert_relative_date_ukrainian(ad_date)
-        return seller_name, ad_date_converted
+    #     ad_date_info = soup.find("li", {"id": "addDate"})
+    #     if ad_date_info:
+    #         ad_date = ad_date_info.find("span").text.strip() if ad_date_info.find("span") else "Не указано"
+    #         logger.info(f"Raw ad date extracted: {ad_date}")  # Добавлено логирование сырой даты
+    #     else:
+    #         logger.warning(f"Ad date element not found in URL: {url}")
+    #         ad_date = "Не указано"
+
+    #     ad_date_converted = self.convert_relative_date_ukrainian(ad_date)
+
+    #     return seller_name, ad_date_converted
+
 
     async def fetch_phone_numbers(self, ad_id, hash_data):
         """Асинхронное получение номеров телефонов."""
         num_url = f'https://auto.ria.com/users/phones/{ad_id}/'
+        logger.info(f"Fetching phone numbers with ad_id: {ad_id}, hash_data: {hash_data}")
         async with self.session.get(num_url, params=hash_data) as response:
             data = await response.json()
             phone_data = data['phones']
-            print(phone_data)
-            clean_numbers = self.clean_phone_numbers(phone_data)
+            clean_numbers = await self.clean_phone_numbers(phone_data)
             return clean_numbers
 
 
@@ -270,7 +323,6 @@ class AsyncCarAdParser:
             logger.error(f"Error saving ad to database: {e}")
 
 
-
     async def main(self):
         start_time = time.time()
         try:
@@ -284,7 +336,14 @@ class AsyncCarAdParser:
 
             async def parse_link(link):
                 async with sem:
-                    return await self.fetch_ad_details(link)
+                    try:
+                        logger.debug(f"Processing link: {link}")
+                        data = await self.extract_all_data(link)
+                        logger.debug(f"Data extracted for link: {link}")
+                        return data
+                    except Exception as e:
+                        logger.error(f"Error processing link {link}: {e}")
+                        return None
                 
             tasks = [parse_link(link) for link in unique_links]
             ad_details_list = await asyncio.gather(*tasks)
