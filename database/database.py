@@ -18,6 +18,7 @@ class CarAd(Base):
     mileage = Column(String)
     engine = Column(String)
     ad_date = Column(Date)
+    price = Column(Integer, nullable=False)
     seller_name = Column(String)
     is_new = Column(Boolean, default=True)
     category = Column(String)
@@ -71,7 +72,7 @@ def get_all_ads():
     session = Session()
     ads = session.query(CarAd).all()
     for ad in ads:
-        print(f"Объявление: {ad.brand} {ad.model} {ad.ad_date} {ad.seller_name} {ad.mileage}, Телефоны: {[phone.number for phone in ad.phone_numbers]}")
+        print(f"Объявление: {ad.brand} {ad.model} {ad.ad_date} {ad.seller_name} {ad.price}, Телефоны: {[phone.number for phone in ad.phone_numbers]}")
     session.close()
     return ads
 

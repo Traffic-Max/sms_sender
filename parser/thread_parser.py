@@ -1,35 +1,17 @@
-#parser/phone_collector.py
 import re
 import json
 import time
 import requests
-import dateparser
-from dateparser import parse
+import concurrent.futures
 from bs4 import BeautifulSoup
-from requests_html import HTMLSession
 from datetime import datetime, timedelta
 from database.database import add_car_ad, init_db, CarAd, Session
 from .parse_config import WEEKDAYS, MONTHS_UK_TO_EN, FILTER_URL, COMPARE_URL, HEADERS, KNOWN_BRANDS
-
-
-from requests.adapters import HTTPAdapter
-from urllib3.util import Retry
-
-
-def requests_retry_session(retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504)):
-    session = requests.Session()
-    retry = Retry(
-        total=retries,
-        read=retries,
-        connect=retries,
-        backoff_factor=backoff_factor,
-        status_forcelist=status_forcelist,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session
-
+import dateparser
+from dateparser import parse
+from requests_html import HTMLSession
+# Используем сессии для повторяющихся запросов
+session = requests.Session()
 
 def translate_date_uk_to_en(date_str):
     for uk, en in MONTHS_UK_TO_EN.items():
@@ -78,14 +60,12 @@ def convert_relative_date_ukrainian(date_str):
 
     return None
 
-
 def get_number(num_url, params, headers):
-    session_with_retry = requests_retry_session()
-    response = session_with_retry.get(url=num_url, params=params, headers=headers)
-    phone_data = json.loads(response.text)['phones']
+    """Получение номера телефона продавца."""
+    response = requests.get(url=num_url, params=params, headers=headers)
+    phone_data = json.loads(response.text)['phones']  # Изменено для получения списка телефонов
     clean_number = clean_phone_numbers(phone_data)
     return clean_number
-
 
 def clean_phone_numbers(phone_data):
     cleaned_numbers = []
@@ -105,8 +85,8 @@ def clean_phone_numbers(phone_data):
 
 
 def get_hash_data(link, HEADERS):
-    session_with_retry = requests_retry_session()
-    response = session_with_retry.get(url=link, headers=HEADERS)
+    """Получение данных hash и expires для каждой ссылки."""
+    response = requests.get(url=link, headers=HEADERS)
     soup = BeautifulSoup(response.text, "html.parser")
     script = soup.find("script", attrs={'src': True, 'data-user-secure-hash': True})
     return {
@@ -154,15 +134,6 @@ def extract_brand_model_year(full_string):
 def get_body_attributes(link, session):
     """Извлечение атрибутов автомобиля из страницы."""
     r = session.get(link)
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    # Проверка, является ли продавец компанией
-    seller_info_area = soup.find("div", class_="seller_info_area")
-    if seller_info_area:
-        seller_type = seller_info_area.find("div", class_="seller_info_title grey")
-        if seller_type and seller_type.get_text(strip=True) == "Компанія":
-            pass  # Пропускаем объявление от компании
-
     body_data = r.html.find('div.auto-wrap', first=True).text.split('\n')
     attributes = {}
     description_flag = False
@@ -232,34 +203,27 @@ def extract_seller_name(url, session):
     seller_name = seller_info.get_text(strip=True) if seller_info else "Не указано"
     return seller_name
 
-
-def main():
-    """Основная функция скрипта."""
-    init_db()  # Инициализация базы данных
-
-    start_time = time.time()
-    # links = get_links(FILTER_URL, COMPARE_URL)
+def get_links(filter_url, compare_url, page):
     session = HTMLSession()
-    # Создание сессии для работы с базой данных
-    db_session = Session()
+    # Использование сессии для запросов
+    page_param = "page=" + str(page)
+    updated_url = filter_url.replace("page=0", page_param) if "page=0" in filter_url else filter_url + "&" + page_param
+    response = session.get(updated_url)
+    return [link for link in response.html.absolute_links if compare_url in link]
 
-    page = 0
-    while True:
-        links = get_links(FILTER_URL, COMPARE_URL, page)
-        if not links:
-            break  # Если нет ссылок, значит достигли последней страницы
-    
-        for link in links:
-            hash_data = get_hash_data(link, HEADERS)
-            ad_id = hash_data['ad_id']
-            if ad_id and hash_data['hash']:
-                num_url = f'https://auto.ria.com/users/phones/{ad_id}/'
-                attributes = get_body_attributes(link, session)
-                seller_name = extract_seller_name(link, session)
-                ad_date = extract_ad_date(link, session)
-                phone_data = get_number(num_url, hash_data, HEADERS)
+def process_link(link):
+    try:
+        hash_data = get_hash_data(link, HEADERS)
+        ad_id = hash_data['ad_id']
+        if ad_id and hash_data['hash']:
+            num_url = f'https://auto.ria.com/users/phones/{ad_id}/'
+            attributes = get_body_attributes(link, session)
+            seller_name = extract_seller_name(link, session)
+            ad_date = extract_ad_date(link, session)
+            phone_data = get_number(num_url, hash_data, HEADERS)
 
-                # Проверка на существующие объявления в базе данных
+            # Обновление или добавление данных в базу данных
+            with Session() as db_session:
                 existing_ad = db_session.query(CarAd).filter_by(seller_name=seller_name, ad_date=ad_date).first()
                 if not existing_ad:
                     add_car_ad(
@@ -271,22 +235,36 @@ def main():
                         ad_date=ad_date,
                         seller_name=seller_name,
                         phone_numbers=phone_data,
-                        price = attributes.get('price'),
                         is_new=True,  # или другое подходящее значение
                         category=attributes.get('category')  # или другое подходящее значение
                     )
+        return True
+    except Exception as e:
+        print(f"Error processing link {link}: {e}")
+        return False
 
-                # Форматированный вывод информации
-                print(f"Автомобиль: {link}")
-                print(f"Продавец: {seller_name}")
-                print(f"Дата создания объявления: {ad_date}")
-                for attr, value in attributes.items():
-                    print(f"{attr.capitalize()}: {value}")
-                print(f"Телефон: {', '.join(phone_data)}")
-                print("-" * 50)  # Разделитель между объявлениями
-        page += 1  # Переход к следующей странице
+def main():
+    init_db()
+    start_time = time.time()
 
-    db_session.close()
+    page = 0
+    all_links = []
+    while True:
+        links = get_links(FILTER_URL, COMPARE_URL, page)
+        if not links:
+            break
+        all_links.extend(links)
+        page += 1
+
+    # Многопоточная обработка ссылок
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(process_link, link) for link in all_links]
+        for future in concurrent.futures.as_completed(futures):
+            if future.result():
+                print(f"Link processed successfully")
+            else:
+                print("Failed to process link")
+
     print(f"Elapsed general time: {time.time() - start_time}")
 
 if __name__ == '__main__':

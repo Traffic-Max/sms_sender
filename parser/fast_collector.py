@@ -112,10 +112,8 @@ class AsyncCarAdParser:
                 html = await response.text()
                 if html:
                     soup = BeautifulSoup(html, "html.parser")
-                    # Извлечение всех данных, включая дату, с помощью BeautifulSoup
                     attributes = self.extract_all_data(soup)
                     if not attributes['ad_date']:
-                        # Если дата не найдена, используйте Selenium
                         ad_date = await self.fetch_ad_date_with_selenium(url)
                         attributes['ad_date'] = ad_date
                     logger.info("Ad details extracted successfully")
@@ -159,15 +157,19 @@ class AsyncCarAdParser:
 
     def extract_all_data(self, soup):
         data = {}
-
         # Марка, модель, и год автомобиля
         car_info = soup.find('span', {'class': 'argument d-link__name'})
         if car_info and car_info.text:
             brand, model, year = self.extract_brand_model_year(car_info.text)
-            data['brand'] = brand
-            data['model'] = model
-            data['year'] = year
+            if brand is not None and model is not None and year is not None:
+                data['brand'] = brand
+                data['model'] = model
+                data['year'] = year
+            else:
+                logger.error("Car info not found in HTML")
+                return None  # Возвращаем None, если информация не найдена
 
+        # Дополнительные данные, такие как цена, пробег, двигатель и т.д.
         try:
             auto_wrap = soup.find('div', {'class': 'auto-wrap'})
             if auto_wrap:
@@ -180,8 +182,10 @@ class AsyncCarAdParser:
                         data['mileage'] = block.split("•")[0].replace("Пробіг", "").strip()
                     elif block.startswith("Двигун"):
                         data['engine'] = block.replace("Двигун", "").strip()
+            else:
+                logger.error("Auto wrap data not found in HTML")
         except Exception as e:
-            logger.error(f"Error processing auto_wrap for, error: {e}")
+            logger.error(f"Error processing auto wrap: {e}")
 
 
         # Информация о продавце и дате объявления
@@ -193,24 +197,25 @@ class AsyncCarAdParser:
         data['ad_date'] = self.convert_relative_date_ukrainian(ad_date)
 
         return data
-    
+
 
     def extract_brand_model_year(self, full_string):
         # Логика извлечения марки, модели и года
-        parts = full_string.split()
-        if parts:
-            year = parts[-1] if parts[-1].isdigit() else None
-            brand_model = ' '.join(parts[:-1]) if year else full_string
-            for brand in self.KNOWN_BRANDS:
-                if brand in brand_model:
-                    start = brand_model.find(brand)
-                    end = start + len(brand)
-                    model = brand_model[end:].strip()
-                    return brand, model, year
-            return None, None, year
+        year_match = re.search(r'\b(19|20)\d{2}\b', full_string)
+        year = year_match.group(0) if year_match else None
+
+        if year:
+            brand_model = full_string.replace(year, '').strip()
         else:
-            return None, None, None
- 
+            brand_model = full_string
+
+        for brand in self.KNOWN_BRANDS:
+            if brand in brand_model:
+                model = brand_model.replace(brand, '').strip()
+                return brand, model, year
+
+        return None, None, year
+
 
     # async def extract_seller_info(self, url, soup):
     #     seller_info = soup.find("div", class_="seller_info_name")
@@ -348,9 +353,10 @@ class AsyncCarAdParser:
             tasks = [parse_link(link) for link in unique_links]
             ad_details_list = await asyncio.gather(*tasks)
             for ad_details in ad_details_list:
-                for key, value in ad_details.items():
-                    print(f"{key}: {value}")
-                print("-" * 50)
+                if ad_details:  # Проверка на None
+                    for key, value in ad_details.items():
+                        print(f"{key}: {value}")
+                    print("-" * 50)
 
             # ... Обработка результатов ...
             elapsed_time = time.time() - start_time
