@@ -161,7 +161,7 @@ def get_body_attributes(link, session):
     if seller_info_area:
         seller_type = seller_info_area.find("div", class_="seller_info_title grey")
         if seller_type and seller_type.get_text(strip=True) == "Компанія":
-            pass  # Пропускаем объявление от компании
+            return None  # Пропускаем объявление от компании
 
     body_data = r.html.find('div.auto-wrap', first=True).text.split('\n')
     attributes = {}
@@ -255,6 +255,9 @@ def main():
             if ad_id and hash_data['hash']:
                 num_url = f'https://auto.ria.com/users/phones/{ad_id}/'
                 attributes = get_body_attributes(link, session)
+                if attributes is None:
+                    continue  # Пропускаем объявление от компании
+
                 seller_name = extract_seller_name(link, session)
                 ad_date = extract_ad_date(link, session)
                 phone_data = get_number(num_url, hash_data, HEADERS)
